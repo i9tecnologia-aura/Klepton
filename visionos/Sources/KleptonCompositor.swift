@@ -1881,7 +1881,7 @@ final class KleptonCompositor {
             }
             frame.endSubmission()
             n += 1
-            if Date() >= next {
+            if Date() > next {   // not `>=`: see csFrames
                 next = Date().addingTimeInterval(2)
                 NSLog("[cp] minimal: \(n) frames presented, state=\(String(describing: layerRenderer.state))")
             }
@@ -1987,7 +1987,14 @@ final class KleptonCompositor {
                 arrayViews.frameDone()
             }
             iterations += 1
-            if Date() >= nextReport {
+            // `>`, never `>=`, between Dates in this file. Built against the
+            // 27.2 SDK, `Date >=` becomes a back-deployment thunk that calls a
+            // WEAK Foundation symbol whenever the OS reports 27.2 or later —
+            // and visionOS 27.2 build 24N5093f reports that without exporting
+            // it, so the call lands on address 0 (KERN_PROTECTION_FAILURE at
+            // 0x0 on this thread, first frame, every launch). `>` is the old,
+            // strongly linked operator, and a log timer cannot tell them apart.
+            if Date() > nextReport {
                 nextReport = Date().addingTimeInterval(0.5)
                 cmdLock.lock(); let done = cmdCompleted; cmdLock.unlock()
                 NSLog("[cp] alive: \(iterations) iters, \(presented) with a picture, "
@@ -2005,7 +2012,7 @@ final class KleptonCompositor {
                 NSLog("[cp] \(stageSummary())")
                 // The haptics queue's own census, every 10 s and only when it
                 // has something to say (see KleptonControllers.hapticsQueue).
-                if Date() >= nextHapticsReport {
+                if Date() > nextHapticsReport {
                     nextHapticsReport = Date().addingTimeInterval(10)
                     if let h = controllers.hapticsSummary() { NSLog("[cp] \(h)") }
                 }
@@ -6464,6 +6471,22 @@ final class KleptonCompositor {
                              hzSettleTimeoutMs, hzSettleMs, hzSettleTol * 100, gaps.count))
             }
         }
+        // A cadence under 70 Hz is not a rate this panel has. It is the system
+        // showing every other frame while it is busy at launch, and it passes:
+        // seen at 49.97 Hz on a panel that runs at 100. A guest told "50 Hz, and
+        // nothing else" can take that badly — SourceVR's engine never left its
+        // loading screen (its main thread stopped before reading its settings).
+        // So a settled rate that is half of a panel rate is reported as that
+        // panel rate.
+        if let mid = chosen, mid > 0, 1.0 / mid < 70 {
+            let doubled = 2.0 / mid
+            if let c = Self.canonicalHz.first(where: { abs(doubled - $0) <= 0.01 * $0 }) {
+                NSLog(String(format: "[cp] %.2f Hz is half of the panel's %.2f Hz (frames shown "
+                             + "twice at launch) — the guest is told the panel's rate",
+                             1.0 / mid, c))
+                chosen = 1.0 / c
+            }
+        }
         if let mid = chosen, mid > 0 {
             displayPeriod = mid          // what the cadence check measures against
             let hz = Float(1.0 / mid)
@@ -6561,7 +6584,7 @@ final class KleptonCompositor {
             autoreleasepool { presented += renderFrame() }
             arrayViews.frameDone()
             iterations += 1
-            if Date() >= nextReport {
+            if Date() > nextReport {   // not `>=`: see csFrames
                 nextReport = Date().addingTimeInterval(2)
                 let sorted = gaps.sorted()
                 let hz = sorted.isEmpty ? 0 : 1 / sorted[sorted.count / 2]

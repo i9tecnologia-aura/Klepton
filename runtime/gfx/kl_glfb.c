@@ -217,6 +217,22 @@ static uint32_t (*a_glCheckFramebufferStatus)(uint32_t);
 static void     (*a_glGetFramebufferAttachmentParameteriv)(uint32_t, uint32_t,
                                                            uint32_t, int32_t *);
 static const uint8_t *(*a_glGetString)(uint32_t);
+static void (*g_real_Flush)(void);   // ANGLE's glFlush; the GL lock commits through it
+static int glfb_errscan(void);
+static int klfb_trace_tex(void);
+static unsigned g_texcalls;
+int kl_glfb_no_msaa(void);
+#define glfb_no_msaa kl_glfb_no_msaa
+// The backend's own extension list, read once with its context current. The
+// list a guest is shown is curated (kl_egl.c); this is what an addition to it
+// is checked against, so that naming an extension stays a promise kept.
+static char g_real_exts[8192];
+int kl_glfb_real_has_extension(const char *name) {
+    if (!name || !*name || !g_real_exts[0]) return -1;       // not known yet
+    char key[128];
+    snprintf(key, sizeof key, " %s ", name);
+    return strstr(g_real_exts, key) != NULL;
+}
 static unsigned (*a_eglMakeCurrent)(void *, void *, void *, void *);
 // ANGLE resolves GLES *extension* entry points (e.g. glTextureViewOES) through its own
 // eglGetProcAddress, not as dlsym-exported symbols — so asym() misses them. Used as a fallback
@@ -272,11 +288,40 @@ static void klfb_TextureViewOES(uint32_t texture, uint32_t target, uint32_t orig
 // every message. The vendored debug ANGLE speaks KHR_debug fluently, so a
 // guest call failing silently (the "0 lit" frame was one) comes with its
 // reason here instead of needing an error-code probe per call site.
+static int klfb_doctor_debug_context(void);
+
 static void klfb_debug_cb(uint32_t source, uint32_t type, uint32_t id,
                           uint32_t severity, int32_t length, const char *msg,
                           const void *user) {
     (void)source; (void)type; (void)id; (void)severity; (void)user;
+    if (klfb_doctor_debug_context() && msg && length > 0) {
+        // Repeating a validation error at every draw would bury the reason.
+        static __thread uint32_t seen[64]; static __thread unsigned count;
+        uint32_t hash = 2166136261u;
+        for (int32_t i = 0; i < length; i++) hash = (hash ^ (uint8_t)msg[i]) * 16777619u;
+        for (unsigned i = 0; i < count; i++) if (seen[i] == hash) return;
+        if (count == 64) return;
+        seen[count++] = hash;
+    }
     fprintf(stderr, "  [glcb] %.*s\n", length, msg ? msg : "");
+}
+
+// Investigation-only debug context for Doctor Who (x3044656825604617, community
+// fix 93): the context is created with EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR, the
+// callback is registered by its ES 3.0 (KHR-suffixed) name, delivery is
+// synchronous and repeats are dropped. Diagnostics: only for that target and only
+// with KL_GLFB_DEBUG_CB=1 (or KL_DOCTOR_DEBUG_CONTEXT=1). Every other target keeps
+// the original EGL attribute sequence (terminated at the first EGL_NONE).
+static int klfb_doctor_debug_context(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (!t) return 0;               // asked before the guest is chosen: not kept
+        on = !strcmp(t, "x3044656825604617") &&
+             kl_env_on("KL_DOCTOR_DEBUG_CONTEXT", kl_env_on("KL_GLFB_DEBUG_CB", 0));
+    }
+    return on;
 }
 
 int kl_glfb_init(void) {
@@ -409,7 +454,11 @@ int kl_glfb_init(void) {
                     g_w, g_h);
     }
     if (!g_surf) g_surf = a_eglCreatePbufferSurface(g_dpy, cfg, surf_attrs);
-    const int32_t ctx_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    const int32_t ctx_attrs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        klfb_doctor_debug_context() ? 0x30FC /* EGL_CONTEXT_FLAGS_KHR */ : EGL_NONE,
+        1 /* EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR */, EGL_NONE
+    };
     g_ctx  = a_eglCreateContext(g_dpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
     if (g_surf && g_ctx && g_flat_ios && !a_eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx)) {
         // The IOSurface surface created but cannot go current: retire it and
@@ -444,12 +493,25 @@ int kl_glfb_init(void) {
     // here instead of needing an error-code probe per call site.
     if (kl_env_on("KL_GLFB_DEBUG_CB", 0)) {
         void (*glDebugMessageCallback)(const void *, const void *) =
-            asym("glDebugMessageCallback");
+            asym(klfb_doctor_debug_context() ? "glDebugMessageCallbackKHR" : "glDebugMessageCallback");
         void (*glEnable)(uint32_t) = asym("glEnable");
         if (glDebugMessageCallback) {
             glDebugMessageCallback((const void *)klfb_debug_cb, NULL);
             // GL_DEBUG_OUTPUT 0x92E0 — synchronous delivery.
             if (glEnable) glEnable(0x92E0);
+            if (klfb_doctor_debug_context()) {
+                if (glEnable) glEnable(0x8242 /* DEBUG_OUTPUT_SYNCHRONOUS */);
+                void (*control)(uint32_t, uint32_t, uint32_t, int32_t, const uint32_t *, uint8_t) =
+                    asym("glDebugMessageControlKHR");
+                if (control) control(0x1100, 0x1100, 0x1100, 0, NULL, 1);
+                void (*insert)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char *) =
+                    asym("glDebugMessageInsertKHR");
+                if (insert) insert(0x824A /* APPLICATION */, 0x8268 /* MARKER */,
+                                   3044, 0x826B /* NOTIFICATION */, -1,
+                                   "Doctor Who KHR_debug callback self-test");
+                fprintf(stderr, "  [glfb] Doctor Who: KHR debug callback installed; "
+                                "look for callback self-test above\n");
+            }
             fprintf(stderr, "  [glfb] KHR_debug callback registered\n");
         } else {
             fprintf(stderr, "  [glfb] no glDebugMessageCallback in this ANGLE\n");
@@ -470,6 +532,7 @@ int kl_glfb_init(void) {
     if (a_glGetString) {
         const char *ext = (const char *)a_glGetString(GL_EXTENSIONS);
         if (!ext) ext = "";
+        snprintf(g_real_exts, sizeof g_real_exts, " %s ", ext);
         fprintf(stderr, "  [glfb] renderable float: EXT_color_buffer_float=%s "
                         "EXT_color_buffer_half_float=%s\n",
                 strstr(ext, "GL_EXT_color_buffer_float") ? "yes" : "NO",
@@ -742,7 +805,11 @@ void kl_glfb_make_current(void) {
                             (unsigned long long)tid, (unsigned long long)g_root_owner);
                 }
                 const int32_t surf_attrs[] = { EGL_WIDTH, g_w, EGL_HEIGHT, g_h, EGL_NONE };
-                const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+                const int32_t ctx_attrs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        klfb_doctor_debug_context() ? 0x30FC /* EGL_CONTEXT_FLAGS_KHR */ : EGL_NONE,
+        1 /* EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR */, EGL_NONE
+    };
                 t->surf = a_eglCreatePbufferSurface(g_dpy, g_cfg, surf_attrs);
                 t->ctx  = a_eglCreateContext(g_dpy, g_cfg, g_ctx, ctx_attrs);
                 // NOT the root owner — this is a second, shared context, so
@@ -752,7 +819,11 @@ void kl_glfb_make_current(void) {
             // SHARED: per-thread contexts — see the mode comment above for why
             // the guest's FBOs break here.
             const int32_t surf_attrs[] = { EGL_WIDTH, g_w, EGL_HEIGHT, g_h, EGL_NONE };
-            const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+            const int32_t ctx_attrs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        klfb_doctor_debug_context() ? 0x30FC /* EGL_CONTEXT_FLAGS_KHR */ : EGL_NONE,
+        1 /* EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR */, EGL_NONE
+    };
             t->surf = a_eglCreatePbufferSurface(g_dpy, g_cfg, surf_attrs);
             // KL_GLFB_NOSHARE_OBJ=1 gives the thread its own context that shares
             // *nothing*. The guest then renders with objects it cannot see, so the
@@ -780,7 +851,11 @@ void kl_glfb_make_current(void) {
         // way; its textures, buffers and programs are not.
         if (!klfb_take_parked(t, tid)) {
             const int32_t surf_attrs[] = { EGL_WIDTH, g_w, EGL_HEIGHT, g_h, EGL_NONE };
-            const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+            const int32_t ctx_attrs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        klfb_doctor_debug_context() ? 0x30FC /* EGL_CONTEXT_FLAGS_KHR */ : EGL_NONE,
+        1 /* EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR */, EGL_NONE
+    };
             t->surf = a_eglCreatePbufferSurface(g_dpy, g_cfg, surf_attrs);
             t->ctx  = a_eglCreateContext(g_dpy, g_cfg, g_ctx, ctx_attrs);
             fprintf(stderr, "  [glfb] thread %llu released its shared context and "
@@ -827,11 +902,24 @@ void kl_glfb_make_current(void) {
         // registration in kl_glfb_init does not cover this thread's context.
         t->debug_cb = 1;
         void (*glDebugMessageCallback)(const void *, const void *) =
-            asym("glDebugMessageCallback");
+            asym(klfb_doctor_debug_context() ? "glDebugMessageCallbackKHR" : "glDebugMessageCallback");
         void (*glEnable)(uint32_t) = asym("glEnable");
         if (glDebugMessageCallback) {
             glDebugMessageCallback((const void *)klfb_debug_cb, NULL);
             if (glEnable) glEnable(0x92E0);
+            if (klfb_doctor_debug_context()) {
+                if (glEnable) glEnable(0x8242 /* DEBUG_OUTPUT_SYNCHRONOUS */);
+                void (*control)(uint32_t, uint32_t, uint32_t, int32_t, const uint32_t *, uint8_t) =
+                    asym("glDebugMessageControlKHR");
+                if (control) control(0x1100, 0x1100, 0x1100, 0, NULL, 1);
+                void (*insert)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char *) =
+                    asym("glDebugMessageInsertKHR");
+                if (insert) insert(0x824A /* APPLICATION */, 0x8268 /* MARKER */,
+                                   3044, 0x826B /* NOTIFICATION */, -1,
+                                   "Doctor Who KHR_debug callback self-test");
+                fprintf(stderr, "  [glfb] Doctor Who: KHR debug callback installed; "
+                                "look for callback self-test above\n");
+            }
         }
     }
 }
@@ -858,7 +946,11 @@ int kl_glfb_borrow_context(void) {
     if (!r_GetCurrentContext || r_GetCurrentContext()) return 0;   // something is current: leave it
     if (!g_borrow_ctx) {
         const int32_t surf_attrs[] = { EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE };
-        const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+        const int32_t ctx_attrs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        klfb_doctor_debug_context() ? 0x30FC /* EGL_CONTEXT_FLAGS_KHR */ : EGL_NONE,
+        1 /* EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR */, EGL_NONE
+    };
         g_borrow_surf = a_eglCreatePbufferSurface(g_dpy, g_cfg, surf_attrs);
         g_borrow_ctx  = a_eglCreateContext(g_dpy, g_cfg, g_ctx, ctx_attrs);
         uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
@@ -1063,6 +1155,9 @@ static unsigned g_shader_pins_n;
 // Garden of the Sea (x3684804704932159, Unity 2019.4.13f1) the eighth: once
 // its storage-buffer shaders linked (KL_GLFB_SSBO_TEX), 227k "Invalid texture
 // unit!" in a session and the soil it is played on drawn black.
+// Beat Saber 1.45 (beatsaber140) the ninth: repeated "Invalid texture unit!"
+// and the Billie Eilish environment's water black and featureless, restored
+// with the pins on (fix 95, its sender's headset; not run here).
 // ...and every Unity title under the profile for untested games (kl_driver.c):
 // seven of the eight Unity fixes for this error were these pins, and a guest
 // without the error has its samplers where its own shader text puts them, which
@@ -1076,7 +1171,8 @@ static int klfb_bind_pins(void) {
         extern kl_guest_kind kl_driver_kind(void);
         extern int kl_untested_profile(void);
         const char *t = kl_driver_target_name();
-        v = kl_env_on("KL_GLFB_BIND_PINS", (t && (strcmp(t, "x2773034772778845") == 0 ||
+        v = kl_env_on("KL_GLFB_BIND_PINS", (t && (strcmp(t, "beatsaber140") == 0 ||
+                                                  strcmp(t, "x2773034772778845") == 0 ||
                                                   strcmp(t, "x2582932495064035") == 0 ||
                                                   strcmp(t, "x2436558143118760") == 0 ||
                                                   strcmp(t, "x4015163475201433") == 0 ||
@@ -3334,6 +3430,125 @@ static int klfb_rewrite_denorm_literals(char *buf, size_t *off, size_t cap) {
     return n;
 }
 
+// Doctor Who build 368 ships multiview programs but uses separate-eye FBOs.
+// Strip both the view-count declaration AND the multiview extension: keeping
+// the extension makes ANGLE emit render_target_array_index even without a view
+// count, and Metal then rejects the ordinary single-view pipeline (host probe).
+//   KL_DOCTOR_SEPARATE=0|1 — default 1 for x3044656825604617, else never.
+// Asked on every draw, so the answer is kept once the target is known.
+static int klfb_doctor_separate(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (!t) return 0;               // asked before the guest is chosen: not kept
+        on = !strcmp(t, "x3044656825604617") && kl_env_on("KL_DOCTOR_SEPARATE", 1);
+    }
+    return on;
+}
+// In separate-eye mode Unity updates its ordinary per-camera matrices. The
+// multiview uniform block is not the current camera: keeping it made the owner
+// see a correctly aligned picture glued to the head. Use Unity's normal names
+// so its existing uniform upload binds the camera for this draw.
+static int klfb_doctor_live_camera(char *buf, size_t cap) {
+    if (!kl_env_on("KL_DOCTOR_CAMERA_LIVE", 1)) return 0;
+    static const char *const oldnames[] = {
+        "hlslcc_mtx4x4unity_StereoMatrixVP", "hlslcc_mtx4x4unity_StereoMatrixV"
+    };
+    static const char *const newnames[] = {
+        "hlslcc_mtx4x4unity_MatrixVP", "hlslcc_mtx4x4unity_MatrixV"
+    };
+    char declarations[256] = "";
+    int changed = 0;
+    for (unsigned k = 0; k < 2; k++) {
+        int hits = 0;
+        for (char *p = buf; (p = strstr(p, oldnames[k])); ) {
+            char *open = p + strlen(oldnames[k]);
+            if (*open != '[') { p = open; continue; }
+            int bound = 0, n = 0;
+            sscanf(open, " [ %d ] ; %n", &bound, &n);
+            if (n && bound == 8) { p = open + n; continue; } // keep the block layout
+            char *end = open + 1;
+            int depth = 1;
+            for (; *end && depth; end++) {
+                if (*end == '[') depth++;
+                else if (*end == ']') depth--;
+            }
+            if (depth) return changed;
+            char replacement[512];
+            int len = snprintf(replacement, sizeof replacement, "%s[((%.*s) & 3)]",
+                               newnames[k], (int)(end - open - 2), open + 1);
+            if (len < 0 || (size_t)len >= sizeof replacement) return changed;
+            char *next = klfb_splice(buf, cap, p, (size_t)(end - p), replacement);
+            if (!next) return changed;
+            p = next; hits++;
+        }
+        if (hits) {
+            char decl[128];
+            snprintf(decl, sizeof decl, "uniform highp vec4 %s[4];\n", newnames[k]);
+            strncat(declarations, decl, sizeof declarations - strlen(declarations) - 1);
+            changed += hits;
+        }
+    }
+    if (changed) {
+        char *insert = strchr(buf, '\n');
+        if (!insert) return 0;
+        insert++;
+        for (char *p = buf; (p = strstr(p, "#extension")); ) {
+            char *end = strchr(p, '\n');
+            if (!end) return 0;
+            insert = p = end + 1;
+        }
+        if (!klfb_splice(buf, cap, insert, 0, declarations)) return 0;
+    }
+    return changed;
+}
+
+static int klfb_doctor_shader(char *buf, size_t cap) {
+    if (!klfb_doctor_separate() || !strstr(buf, "GL_OVR_multiview")) return 0;
+    int changed = 0;
+    for (char *p = buf; (p = strstr(p, "#extension")); ) {
+        char *end = strchr(p, '\n');
+        if (!end) end = p + strlen(p);
+        if ((size_t)(end - p) >= strlen("#extension GL_OVR_multiview") &&
+            strstr(p, "GL_OVR_multiview") && strstr(p, "GL_OVR_multiview") < end) {
+            if (*end) end++;
+            memmove(p, end, strlen(end) + 1);
+            changed = 1;
+        } else p = *end ? end + 1 : end;
+    }
+    for (char *p = buf; (p = strstr(p, "layout")); ) {
+        unsigned views = 0; int n = 0;
+        sscanf(p, "layout ( num_views = %u ) in ; %n", &views, &n);
+        if (n && views == 2) { memmove(p, p + n, strlen(p + n) + 1); changed = 1; }
+        else p += 6;
+    }
+    int needs_eye = 0;
+    for (char *p = buf; (p = strstr(p, "gl_ViewID_OVR")); ) {
+        char *next = klfb_splice(buf, cap, p, strlen("gl_ViewID_OVR"), "kl_doctor_eye_");
+        if (!next) return 0;
+        p = next; needs_eye = 1;
+    }
+    if (needs_eye) {
+        char *insert = strchr(buf, '\n');
+        if (!insert) return 0;
+        insert++;
+        for (char *p = buf; (p = strstr(p, "#extension")); ) {
+            char *end = strchr(p, '\n');
+            if (!end) return 0;
+            insert = p = end + 1;
+        }
+        if (!klfb_splice(buf, cap, insert, 0, "uniform highp uint kl_doctor_eye_;\n")) return 0;
+    }
+    int cameras = klfb_doctor_live_camera(buf, cap);
+    if (cameras) {
+        static unsigned said;
+        if (said++ < 8)
+            fprintf(stderr, "  [glfb] Doctor Who: %d stereo matrix reads use the current per-eye camera\n", cameras);
+    }
+    return changed || needs_eye || cameras;
+}
+
 static void klfb_ShaderSource(uint32_t shader, int32_t count,
                               const char *const *strings, const int32_t *lengths) {
     if (strings && count > 0) {
@@ -3420,6 +3635,12 @@ static void klfb_ShaderSource(uint32_t shader, int32_t count,
             }
             // Either flag sends `buf` to ANGLE instead of the guest's strings.
             int dbg_modified = trimmed;
+            if (klfb_doctor_shader(buf, cap)) {
+                off = strlen(buf); dbg_modified = 1;
+                static unsigned said;
+                if (said++ < 8)
+                    fprintf(stderr, "  [glfb] Doctor Who shader %u: separate-eye program, multiview extension removed\n", shader);
+            }
             {
                 int dn = klfb_rewrite_denorm_literals(buf, &off, cap);
                 if (dn) {
@@ -3713,6 +3934,24 @@ static __thread uint64_t g_draw_t0;
 
 static void klfb_CompileShader(uint32_t shader) {
     if (!g_real_CompileShader) return;
+    // Vacation Simulator (x2393300320759737, community fix 94): ANGLE compiles
+    // shaders asynchronously on background worker threads. Inquiring
+    // GL_COMPILE_STATUS immediately here forces ANGLE to block the main thread
+    // synchronously for each shader under g_compile_lock, freezing the frame
+    // loop for tens of seconds during scene loading. So for that target the
+    // compile is handed straight through: no lock, no status read, and none of
+    // the failure logging below (the guest still reads the status itself).
+    //   KL_GLFB_COMPILE_NOWAIT=0|1 — default 1 for x2393300320759737, else 0.
+    static int nowait = -1;
+    if (nowait < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (t) nowait = kl_env_on("KL_GLFB_COMPILE_NOWAIT", !strcmp(t, "x2393300320759737"));
+    }
+    if (nowait > 0) {
+        g_real_CompileShader(shader);
+        return;
+    }
     // The status/info-log readers are not thunks (the guest must get ANGLE's
     // real answers), so they resolve lazily here rather than through g_thunks,
     // whose entries hand their thunk pointer to the guest.
@@ -3970,6 +4209,29 @@ static void klfb_LinkProgram(uint32_t program) {
     klfb_ssbo_forget(program);
     pthread_mutex_lock(&g_compile_lock);
     uint64_t slow_t0 = klfb_slow_ms() ? klfb_slow_now() : 0;
+    // KL_DOCTOR_LINK_LOG=1 (Doctor Who only, default 0): each link's stages,
+    // source hashes and time — the sender's view of its new-game stalls.
+    uint64_t doctor_link_start = 0;
+    static int doctor_link_log = -1;
+    if (doctor_link_log < 0 && klfb_doctor_separate())
+        doctor_link_log = kl_env_on("KL_DOCTOR_LINK_LOG", 0);
+    if (doctor_link_log > 0) {
+        doctor_link_start = klfb_slow_now();
+        static void (*attached)(uint32_t, int32_t, int32_t *, uint32_t *);
+        if (!attached) attached = asym("glGetAttachedShaders");
+        uint32_t shaders[8]; int32_t count = 0;
+        if (attached) attached(program, 8, &count, shaders);
+        fprintf(stderr, "  [doctor-link] begin program=%u stages=%d", program, count);
+        for (int32_t i = 0; i < count && i < 8; i++) {
+            const char *source = klfb_shader_src(shaders[i]);
+            size_t bytes = source ? strlen(source) : 0;
+            uint32_t hash = 2166136261u;
+            for (size_t j = 0; j < bytes; j++) hash = (hash ^ (uint8_t)source[j]) * 16777619u;
+            fprintf(stderr, " shader=%u/type=%x/bytes=%zu/hash=%08x", shaders[i],
+                    klfb_shader_type(shaders[i]), bytes, hash);
+        }
+        fprintf(stderr, "\n");
+    }
     klfb_pins_bind(program);
     g_real_LinkProgram(program);
     klfb_cs_linked(program);
@@ -4019,6 +4281,9 @@ static void klfb_LinkProgram(uint32_t program) {
             }
         }
     }
+    if (doctor_link_start)
+        fprintf(stderr, "  [doctor-link] complete program=%u elapsed_ms=%.1f\n",
+                program, (double)(klfb_slow_now() - doctor_link_start) / 1.0e6);
     // KL_GLFB_DUMP_PROGRAM=N: print the sources that were linked into program
     // N. The timeline names programs by number ("the frame's last draw is
     // program 7"); this turns the number into the shader text.
@@ -4321,7 +4586,169 @@ static void klfb_tb_forget(uint32_t tex, uint32_t buffer);   // texel-buffer emu
         if (g_real_Delete##Name) g_real_Delete##Name(n, ids);                 \
     }
 
-KLFB_GENDEL(Textures,     KLC_TEX)
+static void (*g_real_GenTextures)(int32_t, uint32_t *);
+static void (*g_real_DeleteTextures)(int32_t, const uint32_t *);
+// Textures by hand: the same bookkeeping, plus a name table.
+//
+// SourceVR's engine (Valve's ToGL) deletes texture names twice. Its own registry
+// says so — "HL2VR-TEXERR: DOUBLE FREE -- GL texture name N was deleted while
+// not live. The name is now free for reuse by a texture that another CGLMTex
+// still points at" — 139 times in one Portal start, in runs of consecutive names.
+// ANGLE hands a freed name out again at the next glGenTextures (its allocator
+// is a free list), so the second delete lands on whatever texture inherited the
+// name, and that texture is gone: the engine binds its name again, GL makes a
+// new, empty object under it, and the surface samples black. Which textures
+// that hits depends on timing, which is why the black walls in Portal change
+// from start to start (and why they are DXT5 world textures: those are what is
+// being created when the stale deletes arrive). A Quest's driver does not
+// reissue names that quickly, which is why the port does not see it there.
+//
+// So for these targets a deleted name is QUARANTINED instead: kept allocated
+// (ANGLE cannot reissue it), really deleted a few seconds later unless the
+// guest deletes it again meanwhile (the double free, dropped) or binds it again
+// (the texture another CGLMTex still points at: kept, and it keeps its texels).
+// KL_GLFB_TEX_QUARANTINE=0/1 overrides the per-target default,
+// KL_GLFB_TEX_QUARANTINE_MS the hold (3000). Off, the table only counts.
+#include <pthread.h>
+enum { KLTN_NONE = 0, KLTN_LIVE = 1, KLTN_DEAD = 2, KLTN_QUAR = 3 };
+static struct {
+    uint8_t  *st;
+    uint64_t *when;
+    uint32_t  cap;
+    uint32_t *pend;          // quarantined names, in delete order
+    uint32_t  npend, cpend;
+    unsigned  stale, dropped, resurrected, freed, reissued, bind_dead, calls;
+} g_tn;
+static pthread_mutex_t g_tn_mu = PTHREAD_MUTEX_INITIALIZER;
+static int klfb_tn_quarantine(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_GLFB_TEX_QUARANTINE", t && strncmp(t, "sourcevr-", 9) == 0);
+        if (on) fprintf(stderr, "  [glfb] texture names: a deleted name is held %d ms before it is "
+                                "freed (KL_GLFB_TEX_QUARANTINE)\n", kl_env_int("KL_GLFB_TEX_QUARANTINE_MS", 3000));
+    }
+    return on;
+}
+static void klfb_tn_grow(uint32_t n) {
+    if (n < g_tn.cap) return;
+    uint32_t c = g_tn.cap ? g_tn.cap : 4096;
+    while (c <= n) c *= 2;
+    g_tn.st   = realloc(g_tn.st, c);
+    g_tn.when = realloc(g_tn.when, c * sizeof *g_tn.when);
+    memset(g_tn.st + g_tn.cap, 0, c - g_tn.cap);
+    memset(g_tn.when + g_tn.cap, 0, (c - g_tn.cap) * sizeof *g_tn.when);
+    g_tn.cap = c;
+}
+static void klfb_tn_summary(const char *why) {
+    fprintf(stderr, "  [glfb] texture names (%s): %u double frees dropped, %u bound again after their "
+                    "delete and kept, %u stale deletes of dead names, %u names reissued by GL, "
+                    "%u binds of a dead name, %u really freed, %u held\n", why,
+            g_tn.dropped, g_tn.resurrected, g_tn.stale, g_tn.reissued, g_tn.bind_dead,
+            g_tn.freed, g_tn.npend);
+}
+static void klfb_tn_really_delete(int32_t n, const uint32_t *ids) {
+    klfb_census_killed(KLC_TEX, n);
+    if (ids) klfb_cimg_forget(n, ids);
+    if (klfb_census_every() && ids)
+        for (int32_t i = 0; i < n; i++) klfb_vram_forget(KLC_TEX, ids[i]);
+    if (ids) for (int32_t i = 0; i < n; i++) klfb_tb_forget(ids[i], 0);
+    if (g_real_DeleteTextures) g_real_DeleteTextures(n, ids);
+}
+// Free what has sat in quarantine long enough and was not claimed back.
+static void klfb_tn_sweep(int all) {
+    uint64_t hold = (uint64_t)kl_env_int("KL_GLFB_TEX_QUARANTINE_MS", 3000) * 1000000ull;
+    uint64_t now = klfb_slow_now();
+    uint32_t out[256]; int nout = 0;
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < g_tn.npend; i++) {
+        uint32_t id = g_tn.pend[i];
+        if (g_tn.st[id] != KLTN_QUAR) continue;                 // claimed back, or freed already
+        if (!all && now - g_tn.when[id] < hold) { g_tn.pend[keep++] = id; continue; }
+        g_tn.st[id] = KLTN_DEAD;
+        out[nout++] = id;
+        g_tn.freed++;
+        if (nout == 256) { klfb_tn_really_delete(nout, out); nout = 0; }
+    }
+    g_tn.npend = keep;
+    if (nout) klfb_tn_really_delete(nout, out);
+}
+static void klfb_GenTextures(int32_t n, uint32_t *ids) {
+    if (g_real_GenTextures) g_real_GenTextures(n, ids);
+    klfb_census_made(KLC_TEX, n);
+    if (!ids) return;
+    pthread_mutex_lock(&g_tn_mu);
+    for (int32_t i = 0; i < n; i++) {
+        klfb_tn_grow(ids[i]);
+        if (g_tn.st[ids[i]] == KLTN_DEAD) g_tn.reissued++;
+        g_tn.st[ids[i]] = KLTN_LIVE;
+    }
+    pthread_mutex_unlock(&g_tn_mu);
+}
+static void klfb_DeleteTextures(int32_t n, const uint32_t *ids) {
+    if (!ids || n <= 0) return;
+    int quar = klfb_tn_quarantine();
+    uint32_t now_ids[256]; int nnow = 0;
+    pthread_mutex_lock(&g_tn_mu);
+    uint64_t now = klfb_slow_now();
+    for (int32_t i = 0; i < n; i++) {
+        uint32_t id = ids[i];
+        if (!id) continue;
+        klfb_tn_grow(id);
+        uint8_t st = g_tn.st[id];
+        if (st == KLTN_QUAR) {
+            g_tn.dropped++;
+            if (g_tn.dropped <= 20)
+                fprintf(stderr, "  [glfb] texture name %u deleted a second time while held — dropped\n", id);
+            continue;
+        }
+        if (st == KLTN_DEAD || st == KLTN_NONE) {
+            g_tn.stale++;
+            if (g_tn.stale <= 10)
+                fprintf(stderr, "  [glfb] texture name %u deleted while %s\n", id,
+                        st == KLTN_DEAD ? "already dead" : "never generated");
+        }
+        if (quar && st == KLTN_LIVE) {
+            g_tn.st[id] = KLTN_QUAR;
+            g_tn.when[id] = now;
+            if (g_tn.npend == g_tn.cpend) {
+                g_tn.cpend = g_tn.cpend ? g_tn.cpend * 2 : 1024;
+                g_tn.pend = realloc(g_tn.pend, g_tn.cpend * sizeof *g_tn.pend);
+            }
+            g_tn.pend[g_tn.npend++] = id;
+            continue;
+        }
+        g_tn.st[id] = KLTN_DEAD;
+        if (nnow < 256) now_ids[nnow++] = id;
+        else { klfb_tn_really_delete(nnow, now_ids); nnow = 0; now_ids[nnow++] = id; }
+    }
+    if (quar) klfb_tn_sweep(0);
+    if ((++g_tn.calls & 255) == 0 && (g_tn.dropped || g_tn.stale || g_tn.resurrected || g_tn.bind_dead))
+        klfb_tn_summary("every 256 deletes");
+    pthread_mutex_unlock(&g_tn_mu);
+    if (nnow) klfb_tn_really_delete(nnow, now_ids);
+}
+// Called from glBindTexture: a held name bound again is a texture the guest
+// still uses, so it is kept.
+static void klfb_tn_bind(uint32_t n) {
+    if (!n || n >= g_tn.cap) return;
+    uint8_t st = g_tn.st[n];
+    if (st == KLTN_LIVE || st == KLTN_NONE) return;
+    pthread_mutex_lock(&g_tn_mu);
+    st = g_tn.st[n];
+    if (st == KLTN_QUAR) {
+        g_tn.st[n] = KLTN_LIVE;
+        g_tn.resurrected++;
+        if (g_tn.resurrected <= 20)
+            fprintf(stderr, "  [glfb] texture name %u bound again after its delete — kept with its texels\n", n);
+    } else if (st == KLTN_DEAD) {
+        g_tn.bind_dead++;
+        if (g_tn.bind_dead <= 10)
+            fprintf(stderr, "  [glfb] texture name %u bound after it was really deleted: GL makes an "
+                            "empty texture under it (samples black)\n", n);
+    }
+    pthread_mutex_unlock(&g_tn_mu);
+}
 KLFB_GENDEL(Renderbuffers, KLC_RBO)
 KLFB_GENDEL(Buffers,      KLC_BUF)
 KLFB_GENDEL(VertexArrays, KLC_VAO)
@@ -4342,6 +4769,111 @@ static void klfb_DeleteFramebuffers(int32_t n, const uint32_t *ids) {
 // this route cannot hide behind a census that only knows about glTexStorage*.
 // Nine arguments, all in registers bar the last pointer, so the natural
 // signature is safe (unlike glTexSubImage3D above).
+// What the guest hands over, looked at before it goes to the GPU. Portal's
+// black walls are DXT5 world textures; SourceVR's engine decodes the sRGB ones
+// on the CPU and uploads RGBA8, the linear ones go up as DXT5 blocks. Whether
+// the colour is already gone in the bytes we are given (the engine's side) or
+// lost after the upload (ours) is the question this answers, per upload:
+// pixels whose RGB is zero while alpha is not, and DXT5 blocks whose two
+// colour endpoints are both zero. KL_GLFB_TEX_STATS=1 turns it on; it was on by
+// default for the SourceVR targets while the black walls were open (the
+// finding: the engine's CPU sRGB-DXT decode, answered by offering s3tc_srgb,
+// kl_egl.c).
+static int klfb_tex_stats(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_TEX_STATS", 0);
+    return on;
+}
+static unsigned g_txs_scanned, g_txs_dark, g_txs_cscanned, g_txs_cdark;
+static void klfb_tex_stats_rgba(int32_t level, int32_t w, int32_t h, uint32_t ifmt, const uint8_t *px) {
+    if (!px || level != 0 || w < 32 || h < 32) return;
+    size_t n = (size_t)w * h, rgb0 = 0, a0 = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t *q = px + i * 4;
+        if (!(q[0] | q[1] | q[2])) rgb0++;
+        if (!q[3]) a0++;
+    }
+    int32_t bound = -1;
+    if (a_glGetIntegerv) a_glGetIntegerv(0x8069, &bound);
+    g_txs_scanned++;
+    int dark = rgb0 * 100 >= n * 95 && a0 * 100 < n * 95;
+    if (dark) g_txs_dark++;
+    if (dark || (g_txs_scanned % 200) == 0)
+        fprintf(stderr, "  [glfb] upload %s: tex=%d %dx%d ifmt=0x%04x rgb-zero %zu%% alpha-zero %zu%% "
+                        "(level-0 RGBA uploads scanned %u, colourless %u)\n",
+                dark ? "COLOURLESS" : "stats", bound, w, h, ifmt, rgb0 * 100 / n, a0 * 100 / n,
+                g_txs_scanned, g_txs_dark);
+}
+// ...and, for every level-0 upload of 64 texels or more whatever its format, the
+// one thing a bug on either side would leave behind: bytes that are ALL zero.
+// The portal rings (256x1 BGR888 gradients) and the aiming ring are black on
+// one start and right on the next (2026-11-01); a zero upload here puts that
+// on the engine's loader, a lit upload that still draws black on GL.
+static unsigned g_txs_zscanned, g_txs_zero;
+static void klfb_tex_stats_zero(const char *call, int32_t level, int32_t w, int32_t h,
+                                uint32_t fmt, uint32_t type, const void *px, size_t bytes) {
+    if (!px || level != 0 || (size_t)w * h < 64) return;
+    if (!bytes) {
+        if (type != 0x1401 /* UNSIGNED_BYTE */) return;
+        int bpp = fmt == 0x1908 || fmt == 0x80E1 ? 4 : fmt == 0x1907 ? 3 :
+                  fmt == 0x190A || fmt == 0x8227 ? 2 : fmt == 0x1909 || fmt == 0x1906 || fmt == 0x1903 ? 1 : 0;
+        if (!bpp) return;
+        bytes = (size_t)w * h * bpp;
+    }
+    const uint8_t *b = px;
+    size_t i = 0;
+    while (i < bytes && !b[i]) i++;
+    g_txs_zscanned++;
+    int zero = i >= bytes;
+    if (zero) g_txs_zero++;
+    // Every level-0 upload, one line, with the thread: the engine specifies a
+    // compressed level twice (a zero buffer, then the data — run 8, 2026-11-01),
+    // so a zero line alone says nothing; a texture whose LAST line is zero, or
+    // whose data arrives on another thread than the draws, is the finding.
+    static int said;
+    if (said++ >= 6000) return;
+    int32_t bound = -1;
+    if (a_glGetIntegerv) a_glGetIntegerv(0x8069, &bound);
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+    fprintf(stderr, "  [glfb] up tex=%d %dx%d fmt=0x%04x %s %s tid=%llu (%u/%u)\n",
+            bound, w, h, fmt, call + 2, zero ? "ZERO" : "data", (unsigned long long)tid,
+            g_txs_zero, g_txs_zscanned);
+}
+// KL_GLFB_TEX_FLUSH=1: a glFlush after every texture upload. The guest runs GL
+// on two threads with two contexts of one share group (the handoff in
+// kl_glfb_make_current); an upload one context has only recorded is not yet in
+// the queue the other context's draws go into. If the per-start black
+// textures stop with this, that ordering is what they are.
+static int klfb_tex_flush(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_TEX_FLUSH", 0);
+    return on;
+}
+static void klfb_tex_flush_now(void) {
+    static void (*flush)(void);
+    if (!flush) flush = asym("glFlush");
+    if (flush) flush();
+}
+static void klfb_tex_stats_dxt5(int32_t level, int32_t w, int32_t h, const uint8_t *blk, int32_t sz) {
+    if (!blk || level != 0 || w < 32 || h < 32 || sz < 16) return;
+    size_t nb = (size_t)sz / 16, c0 = 0, a0 = 0;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blk + i * 16;
+        if (!(b[8] | b[9] | b[10] | b[11])) c0++;     // both colour endpoints zero
+        if (!(b[0] | b[1])) a0++;                     // both alpha endpoints zero
+    }
+    int32_t bound = -1;
+    if (a_glGetIntegerv) a_glGetIntegerv(0x8069, &bound);
+    g_txs_cscanned++;
+    int dark = c0 * 100 >= nb * 95 && a0 * 100 < nb * 95;
+    if (dark) g_txs_cdark++;
+    if (dark || (g_txs_cscanned % 100) == 0)
+        fprintf(stderr, "  [glfb] DXT5 upload %s: tex=%d %dx%d colour-zero blocks %zu%% alpha-zero %zu%% "
+                        "(level-0 DXT5 uploads scanned %u, colourless %u)\n",
+                dark ? "COLOURLESS" : "stats", bound, w, h, c0 * 100 / nb, a0 * 100 / nb,
+                g_txs_cscanned, g_txs_cdark);
+}
+
 static void (*g_real_TexImage2D)(uint32_t, int32_t, int32_t, int32_t, int32_t,
                                  int32_t, uint32_t, uint32_t, const void *);
 // Defined in the ABI-thunks block below; the texture-allocation thunks feed it.
@@ -4351,7 +4883,39 @@ static void klfb_note_tex_storage(uint32_t name, uint32_t fmt, int32_t w,
 static void klfb_TexImage2D(uint32_t target, int32_t level, int32_t ifmt,
                             int32_t w, int32_t h, int32_t border, uint32_t fmt,
                             uint32_t type, const void *pixels) {
+    // An RGB texture fed four bytes a pixel. Desktop GL takes GL_RGB8 with
+    // GL_RGBA data and drops the fourth byte, and so does a Quest's driver; ES 3
+    // proper calls the pair INVALID_OPERATION, ANGLE with it, and the texture is
+    // never allocated — every later glTexSubImage2D on it fails the same way and
+    // it samples black. SourceVR's engine uploads part of its world textures
+    // like this (Portal's dark wall panels and ceilings: drawn, and black).
+    // Allocated as the four-channel format the data has, with alpha read as one,
+    // which is what the three-channel texture would have answered.
+    //
+    // OFF by default (KL_GLFB_RGB8_RGBA=1 turns it on for a run). The textures
+    // concerned are fifteen of 1x1 and three of 128x256. With them allocated
+    // the player's hand and the portal gun come out in posterised false colours
+    // (seen in captures of two sessions, 2026-10-10 and 2026-10-11); with the
+    // uploads refused, as the first session had them, hand and gun look right.
+    // So whatever these textures are, the data handed over is not what a
+    // four-channel reading makes of it, and the game is better off without
+    // them. It does NOT cure the lift's interior going black at close range —
+    // tried, unchanged.
+    int rgbx = 0;
+    if (fmt == 0x1908 /* RGBA */ && type == 0x1401 /* UNSIGNED_BYTE */ &&
+        kl_env_on("KL_GLFB_RGB8_RGBA", 0)) {
+        if (ifmt == 0x8051 /* RGB8 */)       { ifmt = 0x8058 /* RGBA8 */;        rgbx = 1; }
+        else if (ifmt == 0x8C41 /* SRGB8 */) { ifmt = 0x8C43 /* SRGB8_ALPHA8 */; rgbx = 1; }
+    }
     if (level == 0) g_census_teximage++;
+    if (klfb_tex_stats() && fmt == 0x1908 && type == 0x1401)
+        klfb_tex_stats_rgba(level, w, h, (uint32_t)ifmt, pixels);
+    if (klfb_tex_stats())
+        klfb_tex_stats_zero("glTexImage2D", level, w, h, fmt, type, pixels, 0);
+    if (klfb_trace_tex())
+        fprintf(stderr, "  [glfb] #%u glTexImage2D target=0x%04x level=%d ifmt=0x%04x %dx%d "
+                        "fmt=0x%04x type=0x%04x%s\n", g_texcalls++, target, level, ifmt, w, h,
+                fmt, type, pixels ? "" : " (NULL)");
     // A MUTABLE allocation is an allocation: recording only glTexStorage2D/3D
     // leaves a render target created this way invisible to every readback path
     // — the same blindness as a full table, by a different door.
@@ -4364,6 +4928,28 @@ static void klfb_TexImage2D(uint32_t target, int32_t level, int32_t ifmt,
     }
     if (g_real_TexImage2D)
         g_real_TexImage2D(target, level, ifmt, w, h, border, fmt, type, pixels);
+    if (pixels && klfb_tex_flush()) klfb_tex_flush_now();
+    if (rgbx) {
+        static void (*tex_parameteri)(uint32_t, uint32_t, int32_t);
+        if (!tex_parameteri) tex_parameteri = asym("glTexParameteri");
+        uint32_t pt = (target >= 0x8515 && target <= 0x851A) ? 0x8513 /* CUBE_MAP */ : target;
+        if (tex_parameteri) tex_parameteri(pt, 0x8E45 /* TEXTURE_SWIZZLE_A */, 1 /* GL_ONE */);
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] glTexImage2D: RGB8 with RGBA data is allocated as RGBA8 with "
+                            "alpha read as one (ES 3 refuses the pair; said once)\n");
+    }
+    // Under KL_GLFB_ERRSCAN, the arguments of an upload the backend refused: a
+    // texture that fails here stays empty and draws black, and the call name
+    // alone does not say which format combination it was.
+    if (glfb_errscan() && a_glGetError) {
+        uint32_t e = a_glGetError();
+        static int said;
+        if (e && said++ < 40)
+            fprintf(stderr, "  [glfb] errscan: glTexImage2D REFUSED 0x%x: target=0x%04x level=%d "
+                            "ifmt=0x%04x %dx%d fmt=0x%04x type=0x%04x%s\n",
+                    e, target, level, ifmt, w, h, fmt, type, pixels ? "" : " (NULL)");
+    }
 }
 
 static uint32_t (*g_real_CreateShader)(uint32_t);
@@ -5454,13 +6040,48 @@ static int klfb_mvs_read_begin(int32_t *saved) {
     layer(0x8CA8, 0x8CE0, m->color, 0, 0);
     return 1;
 }
+// The framebuffer-to-texture copies, under KL_GLFB_ERRSCAN (and KL_GLFB_TRACE_TEX):
+// what was read from, with the source attachment's colour encoding, and whether
+// the backend took it. ES 3 refuses a copy whose source and destination differ
+// in sRGB-ness (desktop GL and the Quest's driver take it), and a texture a
+// refused copy was meant to fill stays black — SourceVR's engine copies the
+// eye picture into its RGBA8 _rt_FullFrameFB for the portal surfaces' refraction
+// while the eye swapchain is SRGB8_ALPHA8 (Portal 2026-11-01: the portals black).
+static void klfb_copytex_report(const char *call, int32_t level, int32_t x, int32_t y,
+                                int32_t w, int32_t h, uint32_t err) {
+    static int said;
+    if (said++ >= 40) return;
+    int32_t rfb = -1, bound = -1, enc = -1, otype = -1;
+    if (a_glGetIntegerv) {
+        a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &rfb);
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
+    }
+    static void (*getfap)(uint32_t, uint32_t, uint32_t, int32_t *);
+    if (!getfap) getfap = asym("glGetFramebufferAttachmentParameteriv");
+    if (getfap) {
+        uint32_t att = rfb > 0 ? 0x8CE0 /* COLOR_ATTACHMENT0 */ : 0x0405 /* BACK */;
+        getfap(0x8CA8, att, 0x8CD0 /* OBJECT_TYPE */, &otype);
+        getfap(0x8CA8, att, 0x8210 /* COLOR_ENCODING */, &enc);
+    }
+    fprintf(stderr, "  [glfb] %s level=%d (%d,%d) %dx%d from read_fb=%d (attachment type=0x%x "
+                    "encoding=%s) into tex=%d%s%s\n",
+            call, level, x, y, w, h, rfb, otype,
+            enc == 0x8C40 ? "SRGB" : enc == 0x2601 ? "LINEAR" : "?", bound,
+            err ? "  <-- REFUSED 0x" : "", err ? (err == 0x502 ? "502" : "...") : "");
+}
 static void (*g_real_CopyTexImage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t,
                                      int32_t, int32_t, int32_t);
 static void klfb_CopyTexImage2D(uint32_t target, int32_t level, uint32_t ifmt, int32_t x,
                                 int32_t y, int32_t w, int32_t h, int32_t border) {
     int32_t saved = 0;
     int redirected = klfb_mvs_read_begin(&saved);
+    int scan = (glfb_errscan() || klfb_trace_tex()) && a_glGetError;
+    if (scan) while (a_glGetError()) {}
     if (g_real_CopyTexImage2D) g_real_CopyTexImage2D(target, level, ifmt, x, y, w, h, border);
+    if (scan) {
+        uint32_t e = a_glGetError();
+        if (e || klfb_trace_tex()) klfb_copytex_report("glCopyTexImage2D", level, x, y, w, h, e);
+    }
     if (redirected) g_real_BindFramebuffer(0x8CA8, (uint32_t)saved);
 }
 static void (*g_real_CopyTexSubImage2D)(uint32_t, int32_t, int32_t, int32_t, int32_t,
@@ -5469,7 +6090,13 @@ static void klfb_CopyTexSubImage2D(uint32_t target, int32_t level, int32_t xo, i
                                    int32_t x, int32_t y, int32_t w, int32_t h) {
     int32_t saved = 0;
     int redirected = klfb_mvs_read_begin(&saved);
+    int scan = (glfb_errscan() || klfb_trace_tex()) && a_glGetError;
+    if (scan) while (a_glGetError()) {}
     if (g_real_CopyTexSubImage2D) g_real_CopyTexSubImage2D(target, level, xo, yo, x, y, w, h);
+    if (scan) {
+        uint32_t e = a_glGetError();
+        if (e || klfb_trace_tex()) klfb_copytex_report("glCopyTexSubImage2D", level, x, y, w, h, e);
+    }
     if (redirected) g_real_BindFramebuffer(0x8CA8, (uint32_t)saved);
 }
 
@@ -5824,8 +6451,19 @@ static void klfb_TexSubImage2D(uint32_t target, int32_t level, int32_t xoff,
                         "%dx%d at %d,%d fmt=0x%04x type=0x%04x%s\n",
                 g_texcalls++, target, level, w, h, xoff, yoff, format, type,
                 pixels ? "" : " (NULL)");
+    if (klfb_tex_stats() && xoff == 0 && yoff == 0)
+        klfb_tex_stats_zero("glTexSubImage2D", level, w, h, format, type, pixels, 0);
     if (g_real_TexSubImage2D)
         g_real_TexSubImage2D(target, level, xoff, yoff, w, h, format, type, pixels);
+    if (pixels && klfb_tex_flush()) klfb_tex_flush_now();
+    if (glfb_errscan() && a_glGetError) {
+        uint32_t e = a_glGetError();
+        static int said;
+        if (e && said++ < 40)
+            fprintf(stderr, "  [glfb] errscan: glTexSubImage2D REFUSED 0x%x: target=0x%04x level=%d "
+                            "%dx%d at %d,%d fmt=0x%04x type=0x%04x%s\n",
+                    e, target, level, w, h, xoff, yoff, format, type, pixels ? "" : " (NULL)");
+    }
 }
 
 static void klfb_TexStorage2D(uint32_t target, int32_t levels, uint32_t fmt,
@@ -9643,6 +10281,12 @@ static int klfb_block_geom(uint32_t fmt, int *bw, int *bh, int *bytes) {
         case 0x9272: case 0x9273:                       // RG11_EAC (+signed)
         case 0x9278: case 0x9279:                       // RGBA8_ETC2_EAC, SRGB8_A8
             *bytes = 16; return 1;
+        case 0x83F0: case 0x83F1:                       // S3TC DXT1 (RGB, RGBA)
+        case 0x8C4C: case 0x8C4D:                       // ...and their sRGB forms
+            *bytes = 8;  return 1;
+        case 0x83F2: case 0x83F3:                       // DXT3, DXT5
+        case 0x8C4E: case 0x8C4F:                       // ...sRGB
+            *bytes = 16; return 1;
         default: break;
     }
     // ASTC: 0x93B0-0x93BD LDR, 0x93D0-0x93DD sRGB, same footprint order. Always
@@ -9763,6 +10407,58 @@ static void klfb_CompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
         void *padded = klfb_sim_pad_compressed(fmt, w, h, sz, &data);
         g_real_CompressedTexSubImage2D(target, level, xoff, yoff, w, h, fmt, sz, data);
         free(padded);
+        if (glfb_errscan() && a_glGetError) {
+            uint32_t e = a_glGetError();
+            static int said;
+            if (e && said++ < 40)
+                fprintf(stderr, "  [glfb] errscan: glCompressedTexSubImage2D REFUSED 0x%x: target=0x%04x "
+                                "level=%d %dx%d at %d,%d fmt=0x%04x imageSize=%d\n",
+                        e, target, level, w, h, xoff, yoff, fmt, sz);
+        }
+    }
+}
+
+// The whole-level form. SourceVR's engine (Valve's ToGL on GLES) uploads its
+// DXT textures with this call, not the sub-image one, so until now a refused
+// upload of that kind left no line: the texture stays unallocated and samples
+// black. The same three verdicts as above, and under KL_GLFB_ERRSCAN the error.
+static void (*g_real_CompressedTexImage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t,
+                                           int32_t, int32_t, const void *);
+static void klfb_CompressedTexImage2D(uint32_t target, int32_t level, uint32_t fmt,
+                                      int32_t w, int32_t h, int32_t border,
+                                      int32_t sz, const void *data) {
+    int bw, bh, bpb, known = klfb_block_geom(fmt, &bw, &bh, &bpb);
+    long expect = known ? (long)((w + bw - 1) / bw) * ((h + bh - 1) / bh) * bpb : -1;
+    const char *verdict = "";
+    if (!known)            verdict = "  <-- UNKNOWN COMPRESSED FORMAT";
+    else if (expect != sz) verdict = "  <-- SIZE MISMATCH";
+    if (klfb_trace_tex() || *verdict) {
+        int32_t bound = -1;
+        if (a_glGetIntegerv) a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
+        fprintf(stderr, "  [glfb] #%u glCompressedTexImage2D target=0x%04x level=%d %dx%d "
+                        "fmt=0x%04x imageSize=%d expect=%ld (tex=%d)%s%s\n",
+                g_texcalls++, target, level, w, h, fmt, sz, expect, bound,
+                data ? "" : " (NULL)", verdict);
+    }
+    if (level == 0 && w > 0 && h > 0 && a_glGetIntegerv) {
+        int32_t bound = -1;
+        a_glGetIntegerv(0x8069, &bound);
+        if (bound > 0) klfb_note_tex_storage((uint32_t)bound, fmt, w, h);
+    }
+    if (klfb_tex_stats() && (fmt == 0x83F3 || fmt == 0x8C4F))
+        klfb_tex_stats_dxt5(level, w, h, data, sz);
+    if (klfb_tex_stats() && sz > 0)
+        klfb_tex_stats_zero("glCompressedTexImage2D", level, w, h, fmt, 0, data, (size_t)sz);
+    if (g_real_CompressedTexImage2D)
+        g_real_CompressedTexImage2D(target, level, fmt, w, h, border, sz, data);
+    if (data && klfb_tex_flush()) klfb_tex_flush_now();
+    if (glfb_errscan() && a_glGetError) {
+        uint32_t e = a_glGetError();
+        static int said;
+        if (e && said++ < 40)
+            fprintf(stderr, "  [glfb] errscan: glCompressedTexImage2D REFUSED 0x%x: target=0x%04x "
+                            "level=%d %dx%d fmt=0x%04x imageSize=%d%s\n",
+                    e, target, level, w, h, fmt, sz, data ? "" : " (NULL)");
     }
 }
 
@@ -9836,6 +10532,11 @@ static int klfb_cimg_on(void) {
                                                       strcmp(t, "x3386618894743567") == 0 ||
                                                       strcmp(t, "x1906871599408213") == 0 ||
                                                       strcmp(t, "x5190288877703616") == 0 ||
+                                                      // SWORDS of GARGANTUA (UE 4.24):
+                                                      // once it drew, distant scenery and
+                                                      // parts of its opponents stayed
+                                                      // untextured (fix 89, 2026-11-01).
+                                                      strcmp(t, "x3064046640291676") == 0 ||
                                                       // Warhammer 40,000: Battle Sister
                                                       // (Unity) copies its level's textures
                                                       // into 2D arrays while loading, and
@@ -10853,6 +11554,42 @@ static void klfb_apply_vertex_bindings(void) {
     }
 }
 
+static void klfb_doctor_set_eye(void) {
+    if (!klfb_doctor_separate() || !a_glGetIntegerv) return;
+    static int (*getloc)(uint32_t, const char *);
+    static void (*uniform)(int32_t, uint32_t);
+    if (!getloc) getloc = asym("glGetUniformLocation");
+    if (!uniform) uniform = asym("glUniform1ui");
+    if (!getloc || !uniform) return;
+    int32_t program = 0, fb = 0;
+    a_glGetIntegerv(0x8B8D, &program);
+    a_glGetIntegerv(0x8CA6, &fb);
+    if (program <= 0) return;
+    int loc = getloc((uint32_t)program, "kl_doctor_eye_");
+    if (loc < 0) return;
+    uint32_t tex = 0;
+    for (unsigned i = 0; i < g_nfbo_color; i++)
+        if (g_fbo_color[i].fbo == (uint32_t)fb) { tex = g_fbo_color[i].tex; break; }
+    unsigned eye = 0;
+    for (unsigned e = 0; e < 2; e++)
+        for (unsigned stage = 0; stage < KLFB_MAX_STAGES; stage++)
+            if (tex && g_eye_tex_stage[e][stage] == tex) eye = e;
+    // Unity's legacy multi-pass path already uploads the current eye's camera
+    // for each draw. A multiview index of 1 can then select an unpopulated
+    // second slot on the right. Test index 0 for both prepared eye draws;
+    // KL_DOCTOR_VIEW_ZERO=0 restores the explicit eye index for comparison.
+    static int view_zero = -1;
+    if (view_zero < 0) view_zero = kl_env_on("KL_DOCTOR_VIEW_ZERO", 1);
+    unsigned view = view_zero ? 0 : eye;
+    uniform(loc, view);
+    static unsigned seen;
+    if (!(seen & (1u << eye))) {
+        seen |= 1u << eye;
+        fprintf(stderr, "  [glfb] Doctor Who: program %d fb %d texture %u targets eye %u, shader view %u\n",
+                program, fb, tex, eye, view);
+    }
+}
+
 static void klfb_DrawElements(uint32_t mode, int32_t count, uint32_t type,
                               const void *indices) {
     KLFB_VFX_SKIP();
@@ -10860,6 +11597,7 @@ static void klfb_DrawElements(uint32_t mode, int32_t count, uint32_t type,
     // draws, so it reads the pbuffer the frame actually landed in — not the
     // swap thread's, which is empty by construction.
     klfb_apply_vertex_bindings();
+    klfb_doctor_set_eye();
     klfb_service_capture();
     klfb_note_draw();
     klfb_errprobe0("glDrawElements(before)");
@@ -10872,6 +11610,7 @@ static void klfb_DrawElements(uint32_t mode, int32_t count, uint32_t type,
 static void klfb_DrawArrays(uint32_t mode, int32_t first, int32_t count) {
     KLFB_VFX_SKIP();
     klfb_apply_vertex_bindings();
+    klfb_doctor_set_eye();
     klfb_service_capture();
     klfb_note_draw();
     klfb_errprobe0("glDrawArrays(before)");
@@ -10889,6 +11628,7 @@ static void klfb_DrawRangeElements(uint32_t mode, uint32_t start, uint32_t end,
                                    int32_t count, uint32_t type, const void *indices) {
     KLFB_VFX_SKIP();
     klfb_apply_vertex_bindings();
+    klfb_doctor_set_eye();
     klfb_service_capture();
     klfb_note_draw();
     klfb_errprobe0("glDrawRangeElements(before)");
@@ -10906,6 +11646,7 @@ static void klfb_DrawElementsInstanced(uint32_t mode, int32_t count, uint32_t ty
                                        const void *indices, int32_t instances) {
     KLFB_VFX_SKIP();
     klfb_apply_vertex_bindings();
+    klfb_doctor_set_eye();
     klfb_note_draw();
     klfb_errprobe0("glDrawElementsInstanced(before)");
     if (g_real_DrawElementsInstanced)
@@ -10934,6 +11675,7 @@ static void klfb_DrawElementsBaseVertex(uint32_t mode, int32_t count, uint32_t t
                                         const void *indices, int32_t basevertex) {
     KLFB_VFX_SKIP();
     klfb_apply_vertex_bindings();
+    klfb_doctor_set_eye();
     klfb_note_draw();
     static int resolved;
     if (!resolved) {
@@ -10980,6 +11722,7 @@ static void klfb_DrawRangeElementsBaseVertex(uint32_t mode, uint32_t start, uint
                                              int32_t count, uint32_t type,
                                              const void *indices, int32_t basevertex) {
     klfb_apply_vertex_bindings();
+    klfb_doctor_set_eye();
     klfb_service_capture();
     klfb_note_draw();
     static int resolved;
@@ -11023,6 +11766,7 @@ static void klfb_DrawArraysInstanced(uint32_t mode, int32_t first, int32_t count
                                      int32_t instances) {
     KLFB_VFX_SKIP();
     klfb_apply_vertex_bindings();
+    klfb_doctor_set_eye();
     klfb_note_draw();
     klfb_errprobe0("glDrawArraysInstanced(before)");
     if (g_real_DrawArraysInstanced)
@@ -11524,7 +12268,6 @@ void kl_glfb_set_frame_sink(kl_glfb_frame_sink fn, void *ctx) {
 int kl_glfb_has_frame_sink(void) { return g_frame_sink != NULL; }
 unsigned long kl_glfb_last_frame_lit(void) { return g_last_frame_lit; }
 
-static void (*g_real_Flush)(void);
 static void (*g_real_Finish)(void);
 
 // ---- the GPU frame seam (kl_glfb.h) -----------------------------------------
@@ -11754,6 +12497,7 @@ static void (*g_real_BindTexture)(uint32_t, uint32_t);
 static void (*g_real_BindSampler)(uint32_t, uint32_t);
 static void klfb_BindTexture(uint32_t t, uint32_t n) {
     if (a_glGetError) while (a_glGetError()) {}
+    klfb_tn_bind(n);
     if (g_real_BindTexture) g_real_BindTexture(klfb_detarget(t), n);
     // A buffer texture has no sampler state: whatever sampler object sits on
     // its unit is ignored. The 2D texture standing in for it is NOT exempt — a
@@ -12622,6 +13366,7 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glFramebufferTexture2DMultisampleEXT", (void *)klfb_FramebufferTexture2DMultisampleEXT, (void **)&g_real_FramebufferTexture2DMultisampleEXT_ss},
     {"glRenderbufferStorageMultisampleEXT",  (void *)klfb_RenderbufferStorageMultisampleEXT,  (void **)&g_real_RenderbufferStorageMultisampleEXT_ss},
     {"glTexSubImage3D",           (void *)klfb_TexSubImage3D,           (void **)&g_real_TexSubImage3D},
+    {"glCompressedTexImage2D",    (void *)klfb_CompressedTexImage2D,    (void **)&g_real_CompressedTexImage2D},
     {"glCompressedTexSubImage2D", (void *)klfb_CompressedTexSubImage2D, (void **)&g_real_CompressedTexSubImage2D},
     {"glCompressedTexSubImage3D", (void *)klfb_CompressedTexSubImage3D, (void **)&g_real_CompressedTexSubImage3D},
     // the shared-context compile lock — see the block above s10's numbers
@@ -12759,6 +13504,17 @@ static int glfb_state_pname(uint32_t p) {
     case 0x0B74: case 0x0B45:   // DEPTH_FUNC, CULL_FACE_MODE
     case 0x0B71: case 0x0BE2:   // DEPTH_TEST, BLEND (as integers)
         return 1;
+    // The pixel-store alignments, which a guest reads to put back what it found
+    // after an upload of its own. Answered 0 (the fall-through below), SourceVR's
+    // engine restores an alignment of 0 — not a legal value, so the call is
+    // dropped and whatever the upload had set stays in force (asked 32,920 times
+    // in one Portal session). Answering from the real state looked like the
+    // obvious repair and is NOT the default: with it the game's aiming ring and
+    // some menu pages came out black on the device, and without it they had been
+    // right (2026-10-10; which of this and KL_GLFB_RGB8_RGBA it was is not yet
+    // separated). KL_GLFB_REAL_ALIGNMENT=1 answers from the real state.
+    case 0x0CF5: case 0x0D05:   // UNPACK_ALIGNMENT / PACK_ALIGNMENT
+        return kl_env_on("KL_GLFB_REAL_ALIGNMENT", 0);
     }
     return 0;
 }
@@ -12821,6 +13577,17 @@ static void klfb_GetIntegeri_v(uint32_t target, uint32_t index, int32_t *data) {
 static void klfb_GetInternalformativ(uint32_t target, uint32_t internalformat,
                                      uint32_t pname, int32_t bufSize, int32_t *params) {
     if (kl_gl_cap_internalformativ(target, internalformat, pname, bufSize, params)) return;
+    // SourceVR with multisampling draws its right eye empty here: the engine
+    // resolves each eye from a multisampled buffer into one layer of the array
+    // swapchain, and the resolve into layer 1 does not land (seen on the device:
+    // left eye complete, right eye a few fragments, with hlvr_msaa 4; both eyes
+    // complete with it off). Until that resolve is understood the engine is told
+    // there are no sample counts, so the setting in its menu cannot blank an eye.
+    // KL_GL_MSAA=1 offers them again.
+    if (glfb_no_msaa() && (pname == 0x9380 /* NUM_SAMPLE_COUNTS */ || pname == 0x80A9 /* SAMPLES */)) {
+        if (pname == 0x9380 && params && bufSize > 0) params[0] = 0;
+        return;
+    }
     if (g_real_GetInternalformativ)
         g_real_GetInternalformativ(target, internalformat, pname, bufSize, params);
 }
@@ -12892,7 +13659,11 @@ static void *klfb_selftest_thread(void *arg) {
     if (!mkpb || !mkctx || !a_eglMakeCurrent) return NULL;
 
     const int32_t surf_attrs[] = { EGL_WIDTH, 256, EGL_HEIGHT, 256, EGL_NONE };
-    const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    const int32_t ctx_attrs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        klfb_doctor_debug_context() ? 0x30FC /* EGL_CONTEXT_FLAGS_KHR */ : EGL_NONE,
+        1 /* EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR */, EGL_NONE
+    };
     void *surf = mkpb(g_dpy, g_cfg, surf_attrs);
     void *ctx  = mkctx(g_dpy, g_cfg, g_ctx, ctx_attrs);
     fprintf(stderr, "  [glfb] selftest: surf=%p ctx=%p\n", surf, ctx);
@@ -12959,12 +13730,124 @@ static pthread_mutex_t g_gl_lock = PTHREAD_MUTEX_INITIALIZER;
 #define KLGL_LOCK_MAXDEPTH 8
 static _Thread_local uint64_t g_ra_stack[KLGL_LOCK_MAXDEPTH];
 static _Thread_local unsigned g_ra_depth;
-void kl_gl_lock_acquire(uint64_t ra) {
-    if (g_ra_depth < KLGL_LOCK_MAXDEPTH) g_ra_stack[g_ra_depth++] = ra;
-    pthread_mutex_lock(&g_gl_lock);
+// Counted per thread, so a thread that holds the lock for a whole frame (below)
+// can still make its GL calls through the trampoline.
+//
+// Taken with a limit: a thread that cannot get the lock within 300 ms goes on
+// without it, and says so once. A frame's hold is released by the thread that
+// took it, and a guest is free to never come back (a frame abandoned at a
+// handover between threads); a lock that waited for that would freeze the
+// picture for good, which is the thing this lock exists to prevent.
+//
+// A frame's hold can be CALLED BACK. This guest hands its frame loop from the
+// engine's thread to a presentation thread while a map loads, and the engine's
+// thread goes into the load still holding the frame it had begun — for seconds,
+// making GL calls throughout. The presentation thread then waited its 300 ms
+// every frame and drew without the lock beside those uploads, which is the
+// deadlock this lock exists against, by chance (one session survived twelve of
+// those, the next two froze at the same load). So a thread that has waited 5 ms
+// on a frame hold asks for it back, and the holder, at its next GL call —
+// between calls, with its context current — commits what it has recorded, gives
+// the lock up and takes it again for that one call like anyone else. Nothing is
+// released with work still open, which is the rule that matters.
+static _Thread_local unsigned t_gl_holds;
+static _Thread_local int t_gl_frame, t_gl_owned, t_gl_called_back;
+static uint64_t g_gl_holder;          // who has it, for the message below
+static int g_gl_holder_frame;
+static int g_gl_callback;             // a waiter wants the frame hold back
+static int g_gl_waiters;
+static void gl_lock_enter(void) {
+    if (t_gl_holds != 0 && t_gl_frame && t_gl_owned && t_gl_holds == 1 &&
+        __atomic_load_n(&g_gl_callback, __ATOMIC_RELAXED)) {
+        if (g_real_Flush) g_real_Flush();
+        t_gl_owned = 0; t_gl_frame = 0; t_gl_holds = 0; t_gl_called_back = 1;
+        __atomic_store_n(&g_gl_callback, 0, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&g_gl_lock);
+        static int said;
+        if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 6)
+            fprintf(stderr, "  [glfb] a frame's GL hold was called back by a waiting thread "
+                            "and given up between two calls\n");
+        usleep(300);                  // let the waiter in before asking again
+    }
+    if (t_gl_holds++ != 0) return;
+    uint64_t self = 0;
+    pthread_threadid_np(NULL, &self);
+    if (pthread_mutex_trylock(&g_gl_lock) == 0) goto got;
+    __atomic_fetch_add(&g_gl_waiters, 1, __ATOMIC_RELAXED);
+    for (int i = 0; i < 1500; i++) {
+        if (pthread_mutex_trylock(&g_gl_lock) == 0) {
+            __atomic_fetch_sub(&g_gl_waiters, 1, __ATOMIC_RELAXED);
+            goto got;
+        }
+        if (i >= 25 && __atomic_load_n(&g_gl_holder_frame, __ATOMIC_RELAXED))
+            __atomic_store_n(&g_gl_callback, 1, __ATOMIC_RELAXED);
+        usleep(200);
+    }
+    __atomic_fetch_sub(&g_gl_waiters, 1, __ATOMIC_RELAXED);
+    goto missed;
+got:
+    t_gl_owned = 1;
+    __atomic_store_n(&g_gl_holder, self, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_gl_holder_frame, t_gl_frame, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_gl_callback, 0, __ATOMIC_RELAXED);
+    return;
+missed:
+    t_gl_owned = 0;
+    static int said;
+    if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 12)
+        fprintf(stderr, "  [glfb] GL lock not obtained in 300 ms by thread %llu — it goes on without it; "
+                        "held by thread %llu (%s)\n", (unsigned long long)self,
+                (unsigned long long)__atomic_load_n(&g_gl_holder, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_gl_holder_frame, __ATOMIC_RELAXED) ? "a frame hold" : "a single call");
+}
+static void gl_lock_leave(void) {
+    if (!t_gl_holds || --t_gl_holds != 0) return;
+    if (t_gl_owned) {
+        // Someone is waiting: do not hand over with commands still open.
+        if (g_real_Flush && __atomic_load_n(&g_gl_waiters, __ATOMIC_RELAXED) > 0)
+            g_real_Flush();
+        t_gl_owned = 0;
+        pthread_mutex_unlock(&g_gl_lock);
+    }
+}
+// KL_GLFB_ERRSCAN on this path too: the trace trampoline is where it lived, and
+// a target that takes the lock trampoline never passes through that one. Asked
+// after the call and before the lock is given up, so the error is this call's.
+// Draining the queue costs the guest nothing it could see — its own glGetError
+// is answered here and has always said "no error". One line per call name and
+// error code, with a count on the repeats.
+static _Thread_local const char *g_name_stack[KLGL_LOCK_MAXDEPTH];
+static void gl_lock_errscan(const char *name) {
+    static uint32_t (*get_error)(void);
+    if (!get_error) get_error = asym("glGetError");
+    if (!get_error) return;
+    uint32_t e = get_error();
+    if (!e) return;
+    static struct { const char *name; uint32_t err; unsigned n; } seen[96];
+    static int nseen;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    int i;
+    for (i = 0; i < nseen; i++)
+        if (seen[i].name == name && seen[i].err == e) break;
+    if (i == nseen && nseen < 96) { seen[nseen].name = name; seen[nseen].err = e; seen[nseen].n = 0; nseen++; }
+    unsigned n = i < 96 ? ++seen[i].n : 0;
+    pthread_mutex_unlock(&mu);
+    if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000)
+        fprintf(stderr, "  [glfb] errscan: %s -> GL error 0x%x (%u time(s))\n",
+                name ? name : "?", e, n);
+    while (get_error()) { }
+}
+void kl_gl_lock_acquire(uint64_t ra, const klfb_trace_desc *d) {
+    if (g_ra_depth < KLGL_LOCK_MAXDEPTH) {
+        g_name_stack[g_ra_depth] = d ? d->name : NULL;
+        g_ra_stack[g_ra_depth++] = ra;
+    }
+    gl_lock_enter();
 }
 uint64_t kl_gl_lock_release(void) {
-    pthread_mutex_unlock(&g_gl_lock);
+    if (g_ra_depth && glfb_errscan()) gl_lock_errscan(g_name_stack[g_ra_depth - 1]);
+    gl_lock_leave();
     return g_ra_depth ? g_ra_stack[--g_ra_depth] : 0;
 }
 
@@ -13131,10 +14014,67 @@ static int glfb_tracing(void) {
     return getenv_trace_print() || glfb_errscan();
 }
 
+// Default on for SourceVR. Its engine renders on one thread while a second, the
+// OpenXR presentation thread of libvrxr, draws the eyes from a context in the
+// same share group — and ANGLE's Metal backend cannot take that: a texture
+// upload on the first thread waits for the command buffer that last used the
+// texture, which is the second thread's, still open; the second thread is
+// parked on ANGLE's share-group mutex, which the first holds for the length of
+// its call. Neither moves (seen as Portal frozen at its startup graphic, with
+// both threads inside ANGLE). Serialising single calls does not undo that. What
+// does is that the presentation thread's frame is ONE critical section, and its
+// command buffer is committed before it leaves: kl_glfb_frame_enter/leave,
+// called by the OpenXR runtime around the drawing of a frame — from
+// xrAcquireSwapchainImage to the xrReleaseSwapchainImage on the same thread,
+// and again around xrEndFrame's own work. Not from acquire to xrEndFrame: this
+// guest ends a frame on a different thread than the one that drew it when the
+// engine takes presentation over from the bootstrap thread, and the hold would
+// never be given back.
 static int glfb_locking(void) {
     static int on = -1;
-    if (on < 0) on = kl_env_on("KL_GLFB_LOCK", 0);
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_GLFB_LOCK", t && strncmp(t, "sourcevr-", 9) == 0);
+    }
     return on;
+}
+
+int kl_glfb_no_msaa(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        v = (t && strncmp(t, "sourcevr-", 9) == 0) && !kl_env_on("KL_GL_MSAA", 0);
+    }
+    return v;
+}
+
+void kl_glfb_frame_enter(void) {
+    if (!glfb_locking()) return;
+    // A hold this thread still has belongs to a frame it did not finish the
+    // usual way; give it back before starting the next.
+    if (t_gl_frame) kl_glfb_frame_leave();
+    t_gl_frame = 1;
+    gl_lock_enter();
+}
+void kl_glfb_frame_leave(void) {
+    if (t_gl_called_back) {
+        // The hold went back early; the frame still ends with its work committed.
+        t_gl_called_back = 0;
+        if (!t_gl_frame) {
+            gl_lock_enter();
+            if (g_real_Flush) g_real_Flush();
+            gl_lock_leave();
+            return;
+        }
+    }
+    if (!t_gl_frame) return;
+    // Commit what this thread recorded, so nothing of its frame is left open for
+    // another thread to wait on.
+    if (g_real_Flush) g_real_Flush();
+    t_gl_frame = 0;
+    gl_lock_leave();
 }
 
 static void *glfb_wrap_traced(const char *name, void *real) {

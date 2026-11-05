@@ -459,6 +459,8 @@ final class KleptonControllers {
         if surrealHandsMode {
             KleptonSurrealSDK.shared.note("hands mode: hand tracking drives both hands, the controllers are ignored")
         } else {
+            // The controllers are the input again: no fingers around them (see update).
+            for hand in 0...1 { kl_openxr_set_hand_joints(Int32(hand), nil, nil, 0) }
             // After hands mode the SDK's controllers came back misaligned (2026-10-28):
             // restart it so it finds them where they are.
             KleptonSurrealSDK.shared.note("controllers mode: re-aligning them where they are")
@@ -2480,12 +2482,15 @@ final class KleptonControllers {
     // controller/grip corrections: these are the ANATOMICAL joint poses, not
     // simulated Touch controller transforms. The compositor provides anchors
     // for the same presentation instant as its head and controller poses.
+    // They hang from the same wrist as the hand's pose (smoothed in Surreal's
+    // hands mode), so a guest locating them against that pose sees them still.
     private var openXRAxes = [[Int](repeating: -1, count: 26), [Int](repeating: -1, count: 26)]
     private func publishOpenXRJoints(_ anchor: HandAnchor?, hand: Int) {
         guard let anchor, anchor.isTracked, let skeleton = anchor.handSkeleton else {
             kl_openxr_set_hand_joints(Int32(hand), nil, nil, 0)
             return
         }
+        let origin = smoothedWrist[hand] ?? anchor.originFromAnchorTransform
         // Order is XR_HAND_JOINT_*_EXT [0..25]. ARKit has no palm joint, so
         // estimate palm position between wrist and middle-finger metacarpal.
         let names: [HandSkeleton.JointName] = [
@@ -2504,7 +2509,7 @@ final class KleptonControllers {
         var flags = [UInt32](repeating: 0, count: 26)
         for i in 0..<26 {
             let joint = skeleton.joint(names[i])
-            let world = anchor.originFromAnchorTransform * joint.anchorFromJointTransform
+            let world = origin * joint.anchorFromJointTransform
             let t = world.columns.3
             let q = simd_quatf(world)
             let k = i * 8
@@ -2539,6 +2544,18 @@ final class KleptonControllers {
                 at presentationTime: TimeInterval, headTransform: simd_float4x4? = nil) {
         if usesSurrealSDK, KleptonSurrealSDK.shared.takeToggleRequest() { toggleSurrealHands() }
         smoothWrists(leftHand: leftHand, rightHand: rightHand, at: presentationTime)
+        // The fingers for an OpenXR guest (XR_EXT_hand_tracking: BRINK, or Half-Life:
+        // Alyx through xrizer), independent of the emulated controllers and whatever
+        // holds the hand: a Sense controller, or a Surreal through
+        // KleptonSurrealBackend. Not while the Surreal SDK's controllers are the
+        // input: tracked fingers round a held Surreal shook and twisted it in Alyx
+        // (2026-10-29), so the game estimates them from the buttons; its hands mode
+        // brings them back.
+        if Self.brinkHands || kl_openxr_hand_tracking_wanted() != 0,
+           !usesSurrealSDK || surrealHandsMode {
+            publishOpenXRJoints(leftHand, hand: 0)
+            publishOpenXRJoints(rightHand, hand: 1)
+        }
         if usesSurrealSDK, !surrealHandsMode {
             // Already aligned and predicted by the SDK; the hand anchors are its business.
             for hand in 0...1 { submit(KleptonSurrealSDK.shared.sample(hand: hand), hand: hand) }
@@ -2565,12 +2582,6 @@ final class KleptonControllers {
         }
         pollButtons()
         pollGamepad()
-        // Publish per-finger data independently of the emulated controllers.
-        // This must run even when only the Touch-style trigger is in use.
-        if Self.brinkHands {
-            publishOpenXRJoints(leftHand, hand: 0)
-            publishOpenXRJoints(rightHand, hand: 1)
-        }
 
         // **Hands are the fallback for NO controllers, not for a missing one.**
         // With a single Sense controller in use (Walkabout is played one-handed)
@@ -2880,5 +2891,57 @@ final class KleptonControllers {
                                      st.stick.x, st.stick.y)
 
         lock.lock(); state[hand] = st; lock.unlock()
+    }
+}
+
+
+// MARK: - Focus
+
+/// Controller BUTTONS stop reaching the game once another window takes the focus
+/// (the owner, 2026-11-05: working in Mac Virtual Display with mouse and keyboard,
+/// or touching a Spatial Persona with a finger), while the TRACKING goes on — the
+/// poses come from ARKit's accessory tracking, which does not care about focus,
+/// and the buttons from GameController, which delivers to the app in front. It
+/// came back after a tap into the other window and then one on the game.
+///
+/// What this does about it, and how to tell which part helped:
+///   * `GCController.shouldMonitorBackgroundEvents = true` — documented for
+///     macOS and "ignored on iOS"; whether visionOS honours it is what the next
+///     run shows (KL_GC_BACKGROUND=0 leaves it off).
+///   * Every focus signal the app can see goes into the log (`[focus] …`): the
+///     application's and each scene's activation, and which controller
+///     GameController calls current. Lines for when it breaks and when the tap
+///     brings it back say which signal to act on.
+///   * The RealityKit space (Spatial Personas) has a tap target around the
+///     player now (KleptonRealitySpace), so a tap on the game gives it the focus
+///     back the way a tap on the Compositor Services picture always did.
+enum KLControllerFocus {
+    nonisolated(unsafe) private static var started = false
+    nonisolated(unsafe) private static var tokens: [NSObjectProtocol] = []
+
+    static func start() {
+        guard !started else { return }
+        started = true
+        if klEnvOn("KL_GC_BACKGROUND", default: true) {
+            GCController.shouldMonitorBackgroundEvents = true
+            NSLog("[focus] GameController asked for events while not in front (shouldMonitorBackgroundEvents)")
+        }
+        let nc = NotificationCenter.default
+        func watch(_ name: Notification.Name, _ text: String, scene: Bool = false) {
+            tokens.append(nc.addObserver(forName: name, object: nil, queue: .main) { n in
+                var what = text
+                if scene, let sc = n.object as? UIScene {
+                    what += " (\(sc.session.role.rawValue)\(sc.title.map { ", " + $0 } ?? ""))"
+                }
+                if let c = n.object as? GCController { what += " (\(c.vendorName ?? "?"))" }
+                NSLog("[focus] %@", what)
+            })
+        }
+        watch(UIApplication.willResignActiveNotification, "app resigns active")
+        watch(UIApplication.didBecomeActiveNotification, "app active")
+        watch(UIScene.willDeactivateNotification, "scene deactivates", scene: true)
+        watch(UIScene.didActivateNotification, "scene active", scene: true)
+        watch(.GCControllerDidBecomeCurrent, "controller current")
+        watch(.GCControllerDidStopBeingCurrent, "controller no longer current")
     }
 }
